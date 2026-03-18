@@ -1,7 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-# zabbix_netbox_sync v10 | Синхронизация Zabbix → NetBox | Конфиг: config_disk.ini | README: README.md
+# zabbix_netbox_sync v12 | Синхронизация Zabbix → NetBox | Конфиг: config_disk.ini | README: README.md
+# Изменения v12:
+#   - fix: get(name=vm_name) → get(name=vm_name, cluster_id=...) — падал если VM с одним именем в разных кластерах
+#   - fix: диски/интерфейсы VM не удаляются если Zabbix вернул пустые данные (item ещё не собран)
+#   - Интерактив выбора поведения исчезнувших VM перенесён: показывается только при выборе режима PVE/KVM,
+#     после выбора режима синхронизации
 
 
 # --- Импорт ---
@@ -47,7 +52,6 @@ CONFIG_EXAMPLE = """\
     [KVM]
     template_id = 11301
     role_vm     = 76
-    cluster     = KVM
 """
 
 
@@ -86,9 +90,9 @@ def load_config(path=CONFIG_FILE):
         sys.exit(1)
 
     # [KVM]
+    # Параметр cluster удалён — имя кластера = короткое имя device-гипервизора
     kvm_template_id = config.get("KVM", "template_id", fallback=None)
     kvm_role_vm     = config.get("KVM", "role_vm",     fallback=None)
-    kvm_cluster     = config.get("KVM", "cluster",     fallback="KVM")
     try:
         kvm_template_id = int(kvm_template_id) if kvm_template_id else None
         kvm_role_vm     = int(kvm_role_vm)     if kvm_role_vm     else None
@@ -106,7 +110,6 @@ def load_config(path=CONFIG_FILE):
         "pve_domain":      pve_domain.strip(),
         "kvm_template_id": kvm_template_id,
         "kvm_role_vm":     kvm_role_vm,
-        "kvm_cluster":     kvm_cluster.strip(),
     }
 
 
@@ -143,9 +146,9 @@ def compact_text(text):
         if not line:
             continue
         if line.startswith("#"):
-            line = "\\" + line        # экранируем заголовки Markdown
+            line = "\\" + line
         if line.startswith(("-", "*", "+")):
-            line = "\\" + line        # экранируем маркированные списки
+            line = "\\" + line
         result.append(line)
     return "\n".join(result)
 
@@ -170,11 +173,9 @@ def inject_zbx_block(current_comments, new_text):
     new_block = build_zbx_block(new_text) if new_text else ""
 
     if pattern.search(current_comments):
-        # Блок найден — заменяем или удаляем
         result = pattern.sub(new_block, current_comments) if new_block else pattern.sub("", current_comments)
         return result.strip()
 
-    # Блока нет — добавляем в конец (пустая строка перед блоком)
     if new_block:
         base = current_comments.strip()
         return (base + "\n\n" + new_block).strip() if base else new_block
@@ -203,7 +204,7 @@ def loging(data="", namefile="sync"):
 # --- NetBox: get-or-create теги/роли/платформы, retry ---
 
 # Глобальный кэш NetBox (заполняется в init_zabbix_resources)
-ZABBIX_TAG = None   # тег "zbb" — помечает диски, пришедшие из Zabbix
+ZABBIX_TAG = None   # тег "zbb" — помечает объекты, пришедшие из Zabbix
 DISKS_ROLE = None   # роль "Disks" для inventory items
 
 
@@ -222,17 +223,11 @@ def netbox_call_with_retry(fn, retries=3, delay=5):
                 if attempt < retries:
                     time.sleep(delay)
             else:
-                raise  # нестандартная ошибка — не повторяем
+                raise
     raise last_exc
 
 
 def get_or_create_tag(name, color="green"):
-    """
-    Получает существующий тег из NetBox или создаёт новый.
-
-    Использует retry-обёртку для поиска, чтобы переждать кратковременную
-    недоступность NetBox.
-    """
     tag = netbox_call_with_retry(lambda: netbox_api.extras.tags.get(name=name))
     if tag:
         return tag
@@ -242,15 +237,10 @@ def get_or_create_tag(name, color="green"):
         return tag
     except Exception as e:
         loging(f"[TAG CREATE ERROR] {e}", "error")
-        # На случай race condition — перечитываем
         return netbox_call_with_retry(lambda: netbox_api.extras.tags.get(name=name))
 
 
 def get_or_create_inventory_role(name, slug=None):
-    """
-    Получает или создаёт роль для inventory items в NetBox.
-    Роль "Disks" используется для пометки дисков, полученных из Zabbix.
-    """
     if not slug:
         slug = slugify(name)
     role = netbox_call_with_retry(lambda: netbox_api.dcim.inventory_item_roles.get(name=name))
@@ -266,10 +256,6 @@ def get_or_create_inventory_role(name, slug=None):
 
 
 def get_or_create_platform(platform_name):
-    """
-    Получает или создаёт платформу устройства в NetBox (dcim → platforms).
-    Используется для хранения model/product name железного сервера.
-    """
     if not platform_name:
         return None
     platform = netbox_api.dcim.platforms.get(name=platform_name)
@@ -288,10 +274,7 @@ def get_or_create_platform(platform_name):
 
 
 def get_or_create_cluster_type(name):
-    """
-    Получает или создаёт тип кластера виртуализации в NetBox.
-    Примеры типов: "Proxmox VE", "KVM".
-    """
+    """Получает или создаёт тип кластера виртуализации в NetBox."""
     slug = slugify(name)
     ct = netbox_api.virtualization.cluster_types.get(slug=slug)
     if ct:
@@ -320,7 +303,37 @@ def init_zabbix_resources():
     return True
 
 
-# --- Интерактивный выбор: режим, группы, кластеры ---
+# --- Интерактивный выбор: режим, группы, поведение при исчезнувших VM ---
+
+def select_missing_vm_behavior():
+    """
+    Спрашивает пользователя, что делать с VM которые исчезли из гипервизора.
+    Задаётся ОДИН РАЗ в начале скрипта и применяется ко всем режимам (PVE и KVM).
+
+    Returns:
+        str: "delete"  — удалить из NetBox
+             "offline" — оставить, перевести статус в offline
+    """
+    print("\n" + "=" * 50)
+    print("  Поведение при исчезнувших VM")
+    print("  (VM есть в NetBox, но не найдена на гипервизоре)")
+    print("=" * 50)
+    print("  y — Удалить из NetBox")
+    print("  n — Оставить, перевести в статус offline (для истории)")
+    print("=" * 50)
+
+    while True:
+        choice = input("  Удалять исчезнувшие VM? [y/n]: ").strip().lower()
+        if choice == "y":
+            print("  → Исчезнувшие VM будут удалены из NetBox")
+            loging("Missing VM behavior: delete", "sync")
+            return "delete"
+        if choice == "n":
+            print("  → Исчезнувшие VM будут переведены в offline")
+            loging("Missing VM behavior: offline", "sync")
+            return "offline"
+        print("  [!] Введите y или n")
+
 
 def mode_to_flags(mode_str):
     """Строковый ключ режима → (sync_devices, sync_disks, sync_pve_vms, sync_kvm_vms)."""
@@ -463,10 +476,8 @@ def get_linux_host_extended(hostid):
 
     inventory = host.get("inventory", {})
 
-    # serial: dmidecode → fallback inventory
     serial_from_dmidecode = get_item_value(hostid, "dmidecode.SerialNumber")
     serial = serial_from_dmidecode or inventory.get("serialno_a", "").strip()
-
 
     platform_name = get_item_value(hostid, "os.system.product_name")
     if not platform_name:
@@ -487,7 +498,7 @@ def extract_disk_name(key):
 
 
 def get_disk_model(hostid, disk_name, source_type):
-    """Получает модель диска из Zabbix (smart → smart.disk.model, lsi → lsi.pd.model)."""
+    """Получает модель диска из Zabbix."""
     if source_type == "smart":
         key_pattern = f"smart.disk.model[{disk_name}]"
     elif source_type == "lsi":
@@ -549,37 +560,30 @@ def sync_disks(device, zabbix_disks):
 
     print(f"      Дисков в Zabbix: {len(zabbix_serials)}  в NetBox: {len(netbox_serials)}")
 
-    # --- Сценарий 1: диски из Zabbix ---
     for serial in zabbix_serials:
         disk_data = zabbix_disks[serial]
 
         if serial in netbox_disks:
-            # Диск уже есть в NetBox — проверяем каждое поле отдельно
             nb_disk = netbox_disks[serial]
             update_data = {}
             needs_update = False
 
-            # Проверяем статус — должен быть active (диск виден в Zabbix)
             if nb_disk.status and nb_disk.status.value != "active":
                 update_data["status"] = "active"
                 needs_update = True
 
-            # Проверяем наличие тега zbb
             if ZABBIX_TAG and ZABBIX_TAG.id not in [t.id for t in (nb_disk.tags or [])]:
                 update_data["tags"] = [ZABBIX_TAG.id]
                 needs_update = True
 
-            # Проверяем роль (Disks)
             if not nb_disk.role or nb_disk.role.id != DISKS_ROLE.id:
                 update_data["role"] = DISKS_ROLE.id
                 needs_update = True
 
-            # Проверяем имя устройства (например sda → /dev/sda при изменении шаблона)
             if nb_disk.name != disk_data["name"]:
                 update_data["name"] = disk_data["name"]
                 needs_update = True
 
-            # Проверяем модель (part_id)
             if disk_data["model"] and nb_disk.part_id != disk_data["model"]:
                 update_data["part_id"] = disk_data["model"]
                 needs_update = True
@@ -593,12 +597,10 @@ def sync_disks(device, zabbix_disks):
                     print(f"      ! disk {disk_data['name']} [{serial}]  → ERROR: {e}")
                     loging(f"[{device.name}] Disk update error: {e}", "error")
             else:
-                # Все поля совпадают — пропускаем без API-вызова
                 print(f"      = disk {disk_data['name']} [{serial}]  → ok (no changes)")
                 loging(f"[{device.name}] Disk skip (no changes): {serial}", "debug")
 
         else:
-            # Диска нет в NetBox — создаём
             create_data = {
                 "device": device.id,
                 "name":   disk_data["name"][:100],
@@ -617,7 +619,6 @@ def sync_disks(device, zabbix_disks):
                 print(f"      ! disk {disk_data['name']} [{serial}]  → ERROR: {e}")
                 loging(f"[{device.name}] Disk create error: {e}", "error")
 
-    # --- Сценарий 2: диски только в NetBox → offline ---
     for serial in (netbox_serials - zabbix_serials):
         try:
             nb_disk = netbox_disks[serial]
@@ -632,19 +633,17 @@ def sync_disks(device, zabbix_disks):
 def update_netbox_device(hostid, sync_devices=True, sync_disks_flag=True):
     """Обновляет device и/или диски в NetBox по данным из Zabbix."""
     data = get_linux_host_extended(hostid)
-    name = data["hostname"].split(".")[0]   # берём имя без домена
+    name = data["hostname"].split(".")[0]
 
     device = netbox_api.dcim.devices.get(name=name)
     if not device:
         loging(f"[{name}] Device not found in NetBox", "error")
         return
 
-    # --- Синхронизация полей устройства (режим 1) ---
     if sync_devices:
         update_data    = {}
         changed_fields = []
 
-        # Serial — обновляем только если реально изменился
         if data["serial"]:
             old_serial = (device.serial or "").strip()
             if old_serial != data["serial"]:
@@ -654,7 +653,6 @@ def update_netbox_device(hostid, sync_devices=True, sync_disks_flag=True):
                 print(f"      = serial [{data['serial']}]  → ok")
                 loging(f"[{name}] skip serial (no changes)", "debug")
 
-        # Platform — создаём/получаем объект, сравниваем по id
         if data["platform_name"]:
             platform = get_or_create_platform(data["platform_name"])
             if platform:
@@ -666,14 +664,12 @@ def update_netbox_device(hostid, sync_devices=True, sync_disks_flag=True):
                     print(f"      = platform [{data['platform_name']}]  → ok")
                     loging(f"[{name}] skip platform (no changes)", "debug")
 
-        # Тег zbb — добавляем если отсутствует (не удаляем другие теги)
         current_tags = list(device.tags) if device.tags else []
         if ZABBIX_TAG and ZABBIX_TAG.id not in [t.id for t in current_tags]:
             current_tags.append(ZABBIX_TAG.id)
             update_data["tags"] = current_tags
             changed_fields.append("tag: +zbb")
 
-        # ZBX-блок в comments — обновляем только содержимое блока между маркерами
         if data["description"]:
             current_comments = (device.comments or "").strip()
             new_zbx_text     = compact_text(data["description"])
@@ -698,7 +694,6 @@ def update_netbox_device(hostid, sync_devices=True, sync_disks_flag=True):
             print(f"      = device [{name}]  → ok (no changes)")
             loging(f"[{name}] Device skip (no changes)", "debug")
 
-    # --- Синхронизация дисков (режим 2) ---
     if sync_disks_flag:
         zabbix_disks = get_disks_from_zabbix(hostid)
         loging(f"[{name}] Disks found in Zabbix: {len(zabbix_disks)}", "debug")
@@ -719,7 +714,6 @@ def get_pve_hosts_from_zabbix(template_id, allowed_hostids=None):
         allowed_set = {str(h) for h in allowed_hostids}
         hosts = [h for h in hosts if str(h["hostid"]) in allowed_set]
 
-    # Дефолтные макросы из шаблона (хостовые перекрывают)
     templates = zabbix_api.template.get(
         templateids=template_id,
         selectMacros=["macro", "value"]
@@ -732,7 +726,7 @@ def get_pve_hosts_from_zabbix(template_id, allowed_hostids=None):
     for host in hosts:
         data = dict(template_macros)
         for m in host["macros"]:
-            data[m["macro"]] = m["value"]   # макросы хоста перекрывают шаблонные
+            data[m["macro"]] = m["value"]
 
         try:
             token_id_raw = data["{$PVE.TOKEN.ID}"]
@@ -764,8 +758,6 @@ def select_pve_clusters(template_id, allowed_hostids=None):
     if not hosts:
         if allowed_hostids is not None:
             print("[!] PVE-хосты с шаблоном не найдены в выбранных группах.")
-            print("    Подсказка: убедитесь, что PVE-хосты входят в выбранные Zabbix-группы,")
-            print("    или запустите режим '3 — только VM' без выбора групп.")
         else:
             print("[!] PVE-хосты с шаблоном не найдены.")
         return []
@@ -819,8 +811,7 @@ def select_pve_clusters(template_id, allowed_hostids=None):
 def nb_find_device(name):
     """
     Ищет устройство в NetBox сначала по короткому имени, потом по имени+домен.
-
-    Домен берётся из config [PROXMOX] domain (например ".example.com").
+    Домен берётся из config [PROXMOX] domain.
     """
     device = netbox_api.dcim.devices.get(name=name)
     if device:
@@ -831,33 +822,58 @@ def nb_find_device(name):
     return device
 
 
-def get_or_create_cluster(name):
+def get_or_create_pve_cluster_for_node(node_name):
     """
-    Получает или создаёт кластер виртуализации Proxmox VE в NetBox.
-    Тип кластера "Proxmox VE" создаётся автоматически если его нет.
+    Получает или создаёт PVE-кластер для конкретной ноды и привязывает device.
+
+    По аналогии с KVM:
+      - Имя кластера = короткое имя ноды (node_name, например pve-node-01)
+      - Тип кластера = "Proxmox VE" (создаётся автоматически если нет)
+      - device.cluster выставляется в этот кластер
+
+    Args:
+        node_name: короткое имя ноды (без домена)
+
+    Returns:
+        объект кластера NetBox или None при ошибке
     """
-    cluster = netbox_api.virtualization.clusters.get(name=name)
-    if cluster:
-        return cluster
-    cluster_type = get_or_create_cluster_type("Proxmox VE")
-    try:
-        cluster = netbox_api.virtualization.clusters.create(
-            name=name, type=cluster_type.id, status="active"
-        )
-        loging(f"[CLUSTER] Created: {name}", "sync")
-    except Exception:
-        cluster = netbox_api.virtualization.clusters.get(name=name)
-    return cluster
+    nb_cluster = netbox_api.virtualization.clusters.get(name=node_name)
+    if not nb_cluster:
+        cluster_type = get_or_create_cluster_type("Proxmox VE")
+        try:
+            nb_cluster = netbox_api.virtualization.clusters.create(
+                name=node_name, type=cluster_type.id, status="active"
+            )
+            loging(f"[PVE] Cluster created: {node_name}", "sync")
+            print(f"  [+] Кластер NetBox создан: {node_name} (тип Proxmox VE)")
+        except Exception:
+            nb_cluster = netbox_api.virtualization.clusters.get(name=node_name)
+
+    if not nb_cluster:
+        loging(f"[PVE] Failed to get/create cluster for {node_name}", "error")
+        return None
+
+    # Привязываем device к кластеру (device.cluster = этот кластер)
+    device = nb_find_device(node_name)
+    if device:
+        if not device.cluster or device.cluster.id != nb_cluster.id:
+            try:
+                device.cluster = {"id": nb_cluster.id}
+                device.save()
+                loging(f"[PVE] Device {node_name} → cluster {node_name}", "sync")
+                print(f"  [~] Device {node_name} привязан к кластеру {node_name}")
+            except Exception as e:
+                loging(f"[PVE] Device cluster bind error {node_name}: {e}", "error")
+                print(f"  [!] Ошибка привязки device к кластеру: {e}")
+    else:
+        loging(f"[PVE] Device not found in NetBox: {node_name}", "error")
+        print(f"  [!] Device '{node_name}' не найден в NetBox — кластер создан, device не привязан")
+
+    return nb_cluster
 
 
 def parse_mac_from_iface(iface_str):
-    """
-    Извлекает MAC-адрес из строки конфига сетевого интерфейса PVE.
-
-    PVE хранит конфиги сетевых интерфейсов в виде строк:
-    "virtio=AA:BB:CC:DD:EE:FF,bridge=vmbr0,firewall=1"
-    Ключ до '=' — тип сетевой карты (virtio/e1000/e1000e/rtl8139/vmxnet3).
-    """
+    """Извлекает MAC-адрес из строки конфига сетевого интерфейса PVE."""
     for part in iface_str.split(","):
         key, _, val = part.partition("=")
         if key.strip() in ("virtio", "e1000e", "e1000", "rtl8139", "vmxnet3"):
@@ -866,7 +882,7 @@ def parse_mac_from_iface(iface_str):
 
 
 def vm_pve_status_to_nb(pve_status, is_template):
-    """Конвертирует статус PVE VM в NetBox: running→active, stopped→offline, paused→planned."""
+    """Конвертирует статус PVE VM в NetBox."""
     if is_template:
         return "staged"
     return {"running": "active", "stopped": "offline", "paused": "planned"}.get(
@@ -884,7 +900,7 @@ def parse_disk_size_mb(size_str):
 
 
 def parse_lxc_disks(config_lxc, node_name):
-    """Извлекает диски (rootfs, mp*) из конфига LXC. Возвращает [{path, size}, ...]."""
+    """Извлекает диски (rootfs, mp*) из конфига LXC."""
     disks = []
     for key, val in config_lxc.items():
         if key != "rootfs" and not key.startswith("mp"):
@@ -902,7 +918,7 @@ def parse_lxc_disks(config_lxc, node_name):
 
 
 def parse_lxc_interfaces(config_lxc):
-    """Извлекает net-интерфейсы (net0, net1...) из конфига LXC. Возвращает [{name, mac, enabled}]."""
+    """Извлекает net-интерфейсы (net0, net1...) из конфига LXC."""
     interfaces = []
     for key, val in config_lxc.items():
         if not key.startswith("net"):
@@ -955,9 +971,9 @@ def _assign_mac(nb_iface, mac, all_macs_cache):
     if mac in all_macs_cache:
         mac_obj = netbox_api.dcim.mac_addresses.get(mac_address=mac)
         if mac_obj and mac_obj.assigned_object and mac_obj.assigned_object["id"] == nb_iface.id:
-            return  # MAC уже правильно назначен — ничего не делаем
+            return
         if mac_obj:
-            mac_obj.delete()  # MAC занят другим объектом — освобождаем
+            mac_obj.delete()
 
     try:
         mac_obj = netbox_api.dcim.mac_addresses.create({
@@ -971,7 +987,6 @@ def _assign_mac(nb_iface, mac, all_macs_cache):
         loging(f"[MAC] Create error {mac}: {e}", "error")
         return
 
-    # Ставим как primary MAC если не задан
     iface_fresh = netbox_api.virtualization.interfaces.get(id=nb_iface.id)
     if iface_fresh and iface_fresh.primary_mac_address is None:
         iface_fresh.primary_mac_address = {"id": mac_obj.id}
@@ -982,9 +997,20 @@ def _assign_mac(nb_iface, mac, all_macs_cache):
 
 
 def sync_vm_disks_nb(nb_vm, pve_disks):
-    """Синхронизирует virtual_disks VM: PVE→создать/обновить, только NB→удалить."""
-    pve_paths    = {d["path"] for d in pve_disks}
-    nb_vm_disks  = {
+    """
+    Синхронизирует virtual_disks VM: PVE→создать/обновить, только NB→удалить.
+
+    Защита от пустых данных: если pve_disks пуст (ноды недоступны или конфиг
+    не вернул дисков), удаление существующих дисков НЕ производится.
+    """
+    if not pve_disks:
+        nb_count = len(list(netbox_api.virtualization.virtual_disks.filter(virtual_machine_id=nb_vm.id)))
+        loging(f"[{nb_vm.name}] PVE disks: empty — skip sync (protect {nb_count} existing)", "debug")
+        print(f"      Дисков в PVE: 0  в NetBox: {nb_count}  → пропуск (нет данных)")
+        return
+
+    pve_paths   = {d["path"] for d in pve_disks}
+    nb_vm_disks = {
         d.name: d
         for d in netbox_api.virtualization.virtual_disks.filter(virtual_machine_id=nb_vm.id)
     }
@@ -1032,13 +1058,15 @@ def sync_vm_disks_nb(nb_vm, pve_disks):
 
 def sync_vm_interfaces_nb(nb_vm, pve_ifaces, all_macs_cache):
     """
-    Синхронизирует сетевые интерфейсы VM в NetBox (PVE QEMU и LXC).
+    Синхронизирует сетевые интерфейсы VM в NetBox.
 
-    Поведение:
-      - Интерфейс есть в PVE, нет в NB → создаём + назначаем MAC
-      - Интерфейс есть в обоих         → обновляем enabled если изменился + MAC
-      - Интерфейс только в NB          → удаляем (убрали из конфига VM)
+    Защита от пустых данных: если pve_ifaces пуст, удаление существующих
+    интерфейсов НЕ производится.
     """
+    if not pve_ifaces:
+        loging(f"[{nb_vm.name}] PVE ifaces: empty — skip sync", "debug")
+        return
+
     pve_names = {i["name"] for i in pve_ifaces}
     nb_ifaces = {
         i.name: i
@@ -1077,29 +1105,59 @@ def sync_vm_interfaces_nb(nb_vm, pve_ifaces, all_macs_cache):
                 loging(f"[{nb_vm.name}] Interface delete error: {e}", "error")
 
 
-def sync_pve_cluster(cluster_info, allowed_nodes=None):
+def _handle_missing_vm(nb_vm, missing_vm_behavior):
     """
-    Синхронизирует один PVE-кластер (или standalone-ноду) с NetBox.
-
-    Шаги:
-      1. Подключение к ProxmoxAPI по credentials из cluster_info
-      2. Определение имени кластера (из cluster.status или hostname ноды)
-      3. Создание/получение кластера в NetBox
-      4. Привязка физических нод к кластеру в NetBox (device.cluster)
-      5. Обход всех нод: обработка QEMU VM и LXC-контейнеров
-      6. Удаление из NetBox VM, которых нет в PVE (только по обработанным нодам)
+    Обрабатывает VM которая есть в NetBox но не найдена на гипервизоре.
 
     Args:
-        cluster_info:   dict с параметрами подключения (из select_pve_clusters)
-        allowed_nodes:  set коротких имён нод для обработки (None = все)
+        nb_vm:                объект VM из NetBox
+        missing_vm_behavior:  "delete" — удалить, "offline" — перевести в offline
+    """
+    if missing_vm_behavior == "delete":
+        try:
+            nb_vm.delete()
+            loging(f"[VM] Deleted missing VM: {nb_vm.name}", "sync")
+            print(f"    - удалена: {nb_vm.name}")
+        except Exception as e:
+            loging(f"[VM] Delete error {nb_vm.name}: {e}", "error")
+            print(f"    ! ошибка удаления {nb_vm.name}: {e}")
+    else:
+        # offline — сохраняем запись для истории
+        try:
+            current_status = nb_vm.status.value if nb_vm.status else ""
+            if current_status != "offline":
+                nb_vm.update({"status": "offline"})
+                loging(f"[VM] Set offline missing VM: {nb_vm.name}", "sync")
+                print(f"    ~ offline: {nb_vm.name}")
+            else:
+                loging(f"[VM] Already offline (skip): {nb_vm.name}", "debug")
+        except Exception as e:
+            loging(f"[VM] Set offline error {nb_vm.name}: {e}", "error")
+            print(f"    ! ошибка offline {nb_vm.name}: {e}")
+
+
+def sync_pve_cluster(cluster_info, allowed_nodes=None, missing_vm_behavior="delete"):
+    """
+    Синхронизирует ноды PVE с NetBox.
+
+    v12: по аналогии с KVM — каждая нода = отдельный кластер NetBox.
+      - Имя кластера = короткое имя ноды (например pve-node-01)
+      - Тип кластера = "Proxmox VE"
+      - device.cluster привязывается к кластеру ноды
+      - Имя VM = vmid/name (без префикса ноды — кластер и так привязан к ноде)
+      - get() фильтруется по cluster_id во избежание коллизий одинаковых имён
+
+    Args:
+        cluster_info:         dict с параметрами подключения (из select_pve_clusters)
+        allowed_nodes:        set коротких имён нод для обработки (None = все)
+        missing_vm_behavior:  "delete" или "offline" для исчезнувших VM
     """
     role_vm_id = cfg.get("pve_role_vm")
     loging(f"[PVE] Start: {cluster_info['zabbix_name']}", "sync")
-    print(f"\n[PVE] Кластер: {cluster_info['zabbix_name']} ({cluster_info['host']})")
+    print(f"\n[PVE] Подключение: {cluster_info['zabbix_name']} ({cluster_info['host']})")
     if allowed_nodes:
         print(f"  Фильтр нод: {', '.join(sorted(allowed_nodes))}")
 
-    # Подключаемся к Proxmox API
     try:
         proxmox = ProxmoxAPI(
             host=cluster_info["host"],
@@ -1115,56 +1173,6 @@ def sync_pve_cluster(cluster_info, allowed_nodes=None):
         print(f"  [!] Ошибка подключения: {e}")
         return
 
-    # Имя кластера: из cluster.status если это настоящий кластер,
-    # иначе короткое hostname ноды (standalone)
-    try:
-        cluster_status = proxmox.cluster.status.get()
-    except Exception as e:
-        loging(f"[PVE] cluster.status.get() failed {cluster_info['zabbix_name']}: {e}", "error")
-        print(f"  [!] Не удалось получить статус кластера (таймаут или недоступен): {e}")
-        print(f"  [!] Кластер {cluster_info['zabbix_name']} пропущен.")
-        return
-
-    # Определяем имя кластера и является ли это настоящим PVE-кластером
-    cluster_name = cluster_info["zabbix_name"].split(".")[0]
-    is_real_cluster = False
-    for entry in cluster_status:
-        if entry["type"] == "cluster":
-            cluster_name = entry["name"]
-            is_real_cluster = True
-            break
-
-    # Если это настоящий PVE-кластер — обходим ВСЕ ноды через точку входа.
-    # allowed_nodes нужен только для standalone-нод (когда выбрали не все из списка).
-    effective_allowed_nodes = None if is_real_cluster else allowed_nodes
-
-    if is_real_cluster:
-        print(f"  Режим: PVE-кластер '{cluster_name}' — обходим все ноды")
-    else:
-        print(f"  Режим: standalone-нода")
-
-    nb_cluster = get_or_create_cluster(cluster_name)
-    loging(f"[PVE] NetBox cluster: {cluster_name} id={nb_cluster.id} real_cluster={is_real_cluster}", "sync")
-
-    # Привязываем все ноды кластера к кластеру в NetBox
-    for entry in cluster_status:
-        if entry["type"] == "node":
-            device = nb_find_device(entry["name"])
-            if device:
-                if not device.cluster or device.cluster.id != nb_cluster.id:
-                    device.cluster = {"id": nb_cluster.id}
-                    try:
-                        device.save()
-                        loging(f"[PVE] Node {entry['name']} → {cluster_name}", "sync")
-                    except Exception as e:
-                        loging(f"[PVE] Node bind error {entry['name']}: {e}", "error")
-            else:
-                loging(f"[PVE] Node not in NetBox: {entry['name']}", "error")
-
-    # Один запрос для получения всех MAC-адресов кластера (кэш для _assign_mac)
-    all_macs_cache = {str(m.mac_address) for m in netbox_api.dcim.mac_addresses.all()}
-    pve_vm_names   = set()
-
     try:
         nodes = proxmox.nodes.get()
     except Exception as e:
@@ -1172,10 +1180,28 @@ def sync_pve_cluster(cluster_info, allowed_nodes=None):
         print(f"  [!] Не удалось получить список нод: {e}")
         return
 
+    # Определяем является ли это реальным PVE-кластером или standalone-нодой.
+    # Для реального кластера — обходим ВСЕ ноды через API (allowed_nodes игнорируется),
+    # т.к. в Zabbix представлена только одна точка входа, а не каждая нода отдельно.
+    # Для standalone — фильтруем по allowed_nodes (выбранные пользователем ноды).
+    try:
+        cluster_status = proxmox.cluster.status.get()
+        is_real_cluster = any(e["type"] == "cluster" for e in cluster_status)
+    except Exception:
+        is_real_cluster = False
+
+    effective_allowed_nodes = None if is_real_cluster else allowed_nodes
+
+    if is_real_cluster:
+        print(f"  Режим: PVE-кластер — обходим все ноды")
+    else:
+        print(f"  Режим: standalone-нода")
+
+    all_macs_cache = {str(m.mac_address) for m in netbox_api.dcim.mac_addresses.all()}
+
     for node in nodes:
         node_name = node["node"]
 
-        # Для standalone: пропускаем ноды не из выбранного списка
         if effective_allowed_nodes and node_name not in effective_allowed_nodes:
             loging(f"[PVE] Node not in selection, skip: {node_name}", "sync")
             print(f"  [~] Нода пропущена (не выбрана): {node_name}")
@@ -1183,19 +1209,29 @@ def sync_pve_cluster(cluster_info, allowed_nodes=None):
 
         if node["status"] != "online":
             loging(f"[PVE] Node offline, skip: {node_name}", "sync")
+            print(f"  [~] Нода offline, пропускаем: {node_name}")
             continue
+
+        print(f"\n  [>] Нода: {node_name}")
+
+        # Создаём/получаем кластер для этой ноды и привязываем device
+        nb_cluster = get_or_create_pve_cluster_for_node(node_name)
+        if not nb_cluster:
+            print(f"  [!] Не удалось создать/получить кластер для {node_name}, пропускаем")
+            continue
+
+        host_dev     = nb_find_device(node_name)
+        pve_vm_names = set()   # VM видимые на этой ноде (для поиска исчезнувших)
 
         # ── QEMU VM ──────────────────────────────────────────────────────────
         try:
             all_vms_on_node = proxmox.nodes(node_name).qemu.get()
         except Exception as e:
             loging(f"[PVE] qemu.get() failed on {node_name}: {e}", "error")
-            print(f"  [!] Нода {node_name}: не удалось получить список VM, пропускаем: {e}")
-            continue
-        print(f"  [>] Нода: {node_name} — QEMU VM: {len(all_vms_on_node)}")
-        for _vm in all_vms_on_node:
-            print(f"       vmid={_vm['vmid']} name={_vm.get('name','?')} "
-                  f"status={_vm['status']} template={_vm.get('template',0)}")
+            print(f"  [!] Нода {node_name}: не удалось получить список VM: {e}")
+            all_vms_on_node = []
+
+        print(f"    QEMU VM: {len(all_vms_on_node)}")
 
         for vm in all_vms_on_node:
             try:
@@ -1205,24 +1241,26 @@ def sync_pve_cluster(cluster_info, allowed_nodes=None):
                 continue
 
             is_template = bool(vm.get("template", 0))
-            vm_nb_name  = f"{node_name}/{vm['vmid']}/{config_vm['name']}"
+            vm_nb_name  = config_vm["name"]   # просто имя VM, без vmid-префикса
+            vm_serial   = str(vm["vmid"])
             pve_vm_names.add(vm_nb_name)
 
             pve_disks  = parse_vm_disks(config_vm, node_name)
             pve_ifaces = parse_vm_interfaces(config_vm)
             nb_status  = vm_pve_status_to_nb(vm["status"], is_template)
-            host_dev   = nb_find_device(node_name)
 
-            nb_vm = netbox_api.virtualization.virtual_machines.get(name=vm_nb_name)
+            nb_vm = netbox_api.virtualization.virtual_machines.get(
+                name=vm_nb_name, cluster_id=nb_cluster.id
+            )
 
             if nb_vm is None:
-                # --- Создание VM ---
                 create_data = {
                     "name":    vm_nb_name,
                     "cluster": nb_cluster.id,
                     "status":  nb_status,
                     "vcpus":   config_vm.get("cores", 1),
                     "memory":  config_vm.get("memory", 0),
+                    "serial":  vm_serial,
                 }
                 if role_vm_id: create_data["role"]   = role_vm_id
                 if host_dev:   create_data["device"] = host_dev.id
@@ -1247,7 +1285,6 @@ def sync_pve_cluster(cluster_info, allowed_nodes=None):
                     loging(f"[{node_name}] VM create error {vm_nb_name}: {e}", "error")
                     continue
             else:
-                # --- Обновление VM (только изменившиеся поля) ---
                 changed = False
                 changed_fields = []
 
@@ -1269,6 +1306,12 @@ def sync_pve_cluster(cluster_info, allowed_nodes=None):
                 else:
                     loging(f"[{node_name}] VM skip memory (ok): {vm_nb_name}", "debug")
 
+                if (nb_vm.serial or "") != vm_serial:
+                    nb_vm.serial = vm_serial; changed = True
+                    changed_fields.append("serial")
+                else:
+                    loging(f"[{node_name}] VM skip serial (ok): {vm_nb_name}", "debug")
+
                 if role_vm_id and (not nb_vm.role or nb_vm.role.id != role_vm_id):
                     nb_vm.role = role_vm_id; changed = True
                     changed_fields.append("role")
@@ -1277,17 +1320,20 @@ def sync_pve_cluster(cluster_info, allowed_nodes=None):
                     nb_vm.device = host_dev.id; changed = True
                     changed_fields.append("device")
 
-                # comments — обновляем если изменился текст описания (без zbx-блока для VM)
+                # Проверяем привязку к правильному кластеру (на случай переноса VM)
+                if not nb_vm.cluster or nb_vm.cluster.id != nb_cluster.id:
+                    nb_vm.cluster = nb_cluster.id; changed = True
+                    changed_fields.append("cluster")
+
                 descr = compact_text(config_vm.get("description", ""))
                 if descr:
                     cur_comments = (nb_vm.comments or "").strip()
                     if cur_comments != descr:
-                        nb_vm.comments = descr
-                        changed = True; changed_fields.append("comments")
+                        nb_vm.comments = descr; changed = True
+                        changed_fields.append("comments")
                     else:
                         loging(f"[{node_name}] VM skip comments (ok): {vm_nb_name}", "debug")
 
-                # Теги — добавляем новые, не удаляем существующие
                 current_tag_names = {t["name"] for t in (nb_vm.tags or [])}
                 if ZABBIX_TAG and ZABBIX_TAG.name not in current_tag_names:
                     nb_vm.tags = list(nb_vm.tags or []) + [ZABBIX_TAG.id]
@@ -1319,20 +1365,30 @@ def sync_pve_cluster(cluster_info, allowed_nodes=None):
             all_cts_on_node = proxmox.nodes(node_name).lxc.get()
         except Exception as e:
             loging(f"[PVE] lxc.get() failed on {node_name}: {e}", "error")
-            print(f"  [!] Нода {node_name}: не удалось получить список LXC, пропускаем: {e}")
-            continue
+            print(f"  [!] Нода {node_name}: не удалось получить список LXC: {e}")
+            all_cts_on_node = []
+
+        print(f"    LXC: {len(all_cts_on_node)}")
+
         for ct in all_cts_on_node:
-            config_ct   = proxmox.nodes(node_name).lxc(ct["vmid"]).config.get()
+            try:
+                config_ct = proxmox.nodes(node_name).lxc(ct["vmid"]).config.get()
+            except Exception as e:
+                loging(f"[PVE] lxc config.get error vmid={ct['vmid']}: {e}", "error")
+                continue
+
             is_template = bool(ct.get("template", 0))
-            ct_nb_name  = f"{node_name}/{ct['vmid']}/{ct['name']}"
+            ct_nb_name  = ct["name"]   # просто имя контейнера, без vmid-префикса
+            ct_serial   = str(ct["vmid"])
             pve_vm_names.add(ct_nb_name)
 
             pve_disks  = parse_lxc_disks(config_ct, node_name)
             pve_ifaces = parse_lxc_interfaces(config_ct)
             nb_status  = vm_pve_status_to_nb(ct["status"], is_template)
-            host_dev   = nb_find_device(node_name)
 
-            nb_vm = netbox_api.virtualization.virtual_machines.get(name=ct_nb_name)
+            nb_vm = netbox_api.virtualization.virtual_machines.get(
+                name=ct_nb_name, cluster_id=nb_cluster.id
+            )
 
             if nb_vm is None:
                 create_data = {
@@ -1341,6 +1397,7 @@ def sync_pve_cluster(cluster_info, allowed_nodes=None):
                     "status":  nb_status,
                     "vcpus":   config_ct.get("cores", 1),
                     "memory":  config_ct.get("memory", 0),
+                    "serial":  ct_serial,
                 }
                 if role_vm_id: create_data["role"]   = role_vm_id
                 if host_dev:   create_data["device"] = host_dev.id
@@ -1386,6 +1443,12 @@ def sync_pve_cluster(cluster_info, allowed_nodes=None):
                 else:
                     loging(f"[{node_name}] LXC skip memory (ok): {ct_nb_name}", "debug")
 
+                if (nb_vm.serial or "") != ct_serial:
+                    nb_vm.serial = ct_serial; changed = True
+                    changed_fields.append("serial")
+                else:
+                    loging(f"[{node_name}] LXC skip serial (ok): {ct_nb_name}", "debug")
+
                 if role_vm_id and (not nb_vm.role or nb_vm.role.id != role_vm_id):
                     nb_vm.role = role_vm_id; changed = True
                     changed_fields.append("role")
@@ -1394,16 +1457,19 @@ def sync_pve_cluster(cluster_info, allowed_nodes=None):
                     nb_vm.device = host_dev.id; changed = True
                     changed_fields.append("device")
 
+                if not nb_vm.cluster or nb_vm.cluster.id != nb_cluster.id:
+                    nb_vm.cluster = nb_cluster.id; changed = True
+                    changed_fields.append("cluster")
+
                 descr = compact_text(config_ct.get("description", ""))
                 if descr:
                     cur_comments = (nb_vm.comments or "").strip()
                     if cur_comments != descr:
-                        nb_vm.comments = descr
-                        changed = True; changed_fields.append("comments")
+                        nb_vm.comments = descr; changed = True
+                        changed_fields.append("comments")
                     else:
                         loging(f"[{node_name}] LXC skip comments (ok): {ct_nb_name}", "debug")
 
-                # Тег zbb — добавляем если отсутствует
                 current_tag_names = {t["name"] for t in (nb_vm.tags or [])}
                 if ZABBIX_TAG and ZABBIX_TAG.name not in current_tag_names:
                     nb_vm.tags = list(nb_vm.tags or []) + [ZABBIX_TAG.id]
@@ -1423,86 +1489,32 @@ def sync_pve_cluster(cluster_info, allowed_nodes=None):
             sync_vm_disks_nb(nb_vm, pve_disks)
             sync_vm_interfaces_nb(nb_vm, pve_ifaces, all_macs_cache)
 
-    # Удаляем из NetBox VM, которых нет в PVE.
-    # Для кластера — удаляем по всем нодам (обошли все).
-    # Для standalone — только по нодам, которые обрабатывались.
-    for nb_vm in netbox_api.virtualization.virtual_machines.filter(cluster_id=nb_cluster.id):
-        if nb_vm.name in pve_vm_names:
-            continue
-        vm_node = nb_vm.name.split("/")[0] if "/" in nb_vm.name else ""
-        if effective_allowed_nodes and vm_node not in effective_allowed_nodes:
-            continue  # standalone: нода не обрабатывалась — не трогаем
-        try:
-            nb_vm.delete()
-            loging(f"[PVE] VM deleted: {nb_vm.name}", "sync")
-            print(f"    - удалена: {nb_vm.name}")
-        except Exception as e:
-            loging(f"[PVE] VM delete error {nb_vm.name}: {e}", "error")
+        # Обработка исчезнувших VM на этой ноде
+        for nb_vm in netbox_api.virtualization.virtual_machines.filter(cluster_id=nb_cluster.id):
+            if nb_vm.name not in pve_vm_names:
+                _handle_missing_vm(nb_vm, missing_vm_behavior)
 
-    loging(f"[PVE] Done: {cluster_name}", "sync")
+    loging(f"[PVE] Done: {cluster_info['zabbix_name']}", "sync")
 
 
 # --- Синхронизация VM KVM ---
 #
-# ─────────────────────────────────────────────────────────────────────────────
-# Архитектура шаблона "Tempalte KVM":
+# Архитектура v11:
+#   - Каждый KVM-гипервизор = отдельный кластер в NetBox
+#   - Имя кластера = короткое имя device (например vv-kvm-01)
+#   - Тип кластера = "KVM" (создаётся автоматически)
+#   - device.cluster выставляется в этот кластер
+#   - Имя VM = просто VMNAME (без префикса ноды, т.к. кластер = конкретный гипервизор)
 #
-#  RAW items (мастер-items, тип TEXT, lastvalue = JSON):
-#    vmstatus          — статусы всех VM на гипервизоре
-#    vmstatistic_cpu_mem — CPU и память всех VM
-#    vm_blk_discovery  — диски всех VM (для LLD discovery дисков)
-#    vmlist_network    — сетевые интерфейсы всех VM (для LLD discovery сети)
-#
-#  Dependent items (создаются LLD discovery из мастер-items):
-#    vmstatus.name             — LLD discovery rule (из vmstatus)
-#    vmstatus.status[VMNAME]   — статус конкретной VM (строка "running"/"shut off")
-#    disk.Capacity[VMNAME,TGT] — размер диска в байтах
-#    vmlist.MAC[VMNAME,NET]    — MAC-адрес интерфейса
-#    ... и др. (метрики CPU, RAM, сети — для мониторинга, не для инвентаризации)
-#
-# ─────────────────────────────────────────────────────────────────────────────
-# Что мы читаем и откуда:
-#
-#  vmstatus (raw JSON) → список VM и их статусов
-#    {"data": [{"VMNAME": "myvm", "STATUS": "running"}, ...]}
-#
-#    ВАЖНО: в Zabbix вы видите dependent items vmstatus.status[myvm] = "running",
-#    но для инвентаризации мы читаем именно мастер-item vmstatus (один запрос
-#    для всех VM сразу, без N запросов по одному). Если vmstatus пустой —
-#    значит шаблон ещё не собрал данные (нужно подождать или проверить скрипт
-#    сбора данных на гипервизоре).
-#
-#  vmstatistic_cpu_mem (raw JSON) → CPU и RAM
-#    {"data": [{"VMNAME": "myvm", "actual": 4294967296, "nrVirtCpu": 4}, ...]}
-#    actual    = полный объём ОЗУ VM в байтах → конвертируем в МБ
-#    nrVirtCpu = количество vCPU
-#
-#  vm_blk_discovery (raw JSON) → диски
-#    {"data": [{"VMNAME": "myvm", "Target": "vda",
-#               "Source": "/var/lib/libvirt/images/myvm.qcow2",
-#               "Device": "disk", "Type": "file"}, ...]}
-#    cdrom и floppy пропускаем.
-#    Размер читаем через dependent item disk.Capacity[VMNAME,TARGET] (байты).
-#
-#  vmlist_network (raw JSON) → сетевые интерфейсы
-#    {"data": [{"VMNAME": "myvm", "Interface": "vnet0",
-#               "MAC": "aa:bb:cc:dd:ee:ff", "Model": "virtio",
-#               "Source": "br0", "Type": "bridge"}, ...]}
-#    Interface == "-1" = нет сети (фильтруется как в LLD шаблона).
-#
-# ─────────────────────────────────────────────────────────────────────────────
-# Имя VM в NetBox: "<node_shortname>/<VMNAME>"
-# (у KVM нет vmid как в PVE — используем только имя)
-#
-# ==============================================================================
+# Данные читаются из Zabbix items шаблона KVM:
+#   vmstatus.status[VMNAME]  — статус VM (dependent LLD items)
+#   vmstatistic_cpu_mem      — CPU и RAM (RAW JSON master item)
+#   vm_blk_discovery         — диски (RAW JSON master item)
+#   vmlist_network           — сетевые интерфейсы (RAW JSON master item)
+
 
 def get_kvm_hosts_from_zabbix(template_id, allowed_hostids=None):
-    """
-    Получает список KVM-гипервизоров из Zabbix по ID шаблона (11301).
-
-    Returns:
-        list[dict]: [{zabbix_name, hostid, display}, ...]
-    """
+    """Получает список KVM-гипервизоров из Zabbix по ID шаблона."""
     hosts = zabbix_api.host.get(templateids=template_id, output=["hostid", "host", "name"])
     if allowed_hostids is not None:
         allowed_set = {str(h) for h in allowed_hostids}
@@ -1514,12 +1526,7 @@ def get_kvm_hosts_from_zabbix(template_id, allowed_hostids=None):
 
 
 def select_kvm_hosts(template_id, allowed_hostids=None):
-    """
-    Интерактивный выбор KVM-гипервизоров (аналог select_pve_clusters).
-
-    Returns:
-        list[dict]: выбранные хосты
-    """
+    """Интерактивный выбор KVM-гипервизоров (аналог select_pve_clusters)."""
     print("\nЗагружаю KVM-хосты из Zabbix...")
     hosts = get_kvm_hosts_from_zabbix(template_id, allowed_hostids=allowed_hostids)
 
@@ -1576,13 +1583,7 @@ def select_kvm_hosts(template_id, allowed_hostids=None):
 def get_kvm_raw_item(hostid, item_key):
     """
     Читает lastvalue RAW-item (тип TEXT) из Zabbix по точному ключу и парсит JSON.
-
-    Используем filter= (точное совпадение ключа), а не search= (LIKE).
-    Это важно: мастер-items шаблона KVM имеют точные ключи без параметров
-    (vmstatus, vm_blk_discovery, и т.д.), и search мог бы вернуть
-    dependent items с похожими ключами (vmstatus.status[...]).
-
-    Возвращает распарсенный dict/list или None при ошибке/пустом значении.
+    Используем filter= (точное совпадение) чтобы не захватить dependent items.
     """
     items = zabbix_api.item.get(
         hostids=hostid,
@@ -1604,13 +1605,7 @@ def get_kvm_raw_item(hostid, item_key):
 
 
 def get_kvm_dependent_value(hostid, item_key):
-    """
-    Читает lastvalue одного dependent item из Zabbix по точному ключу.
-
-    Используется для disk.Capacity[VMNAME,TARGET] и аналогичных
-    dependent items с параметрами в ключе.
-    Возвращает строку или None.
-    """
+    """Читает lastvalue одного dependent item из Zabbix по точному ключу."""
     items = zabbix_api.item.get(
         hostids=hostid,
         filter={"key_": item_key},
@@ -1623,7 +1618,7 @@ def get_kvm_dependent_value(hostid, item_key):
 
 
 def kvm_status_to_nb(status_str):
-    """Конвертирует статус KVM VM в NetBox: running→active, shut off→offline, paused→planned."""
+    """Конвертирует статус KVM VM в NetBox."""
     return {
         "running":     "active",
         "shut off":    "offline",
@@ -1637,41 +1632,63 @@ def kvm_status_to_nb(status_str):
     }.get((status_str or "").strip().lower(), "offline")
 
 
-def get_or_create_kvm_cluster(cluster_name):
-    """Получает или создаёт KVM-кластер в NetBox (тип KVM создаётся автоматически)."""
-    cluster = netbox_api.virtualization.clusters.get(name=cluster_name)
-    if cluster:
-        return cluster
-    cluster_type = get_or_create_cluster_type("KVM")
-    try:
-        cluster = netbox_api.virtualization.clusters.create(
-            name=cluster_name, type=cluster_type.id, status="active"
-        )
-        loging(f"[KVM] Cluster created: {cluster_name}", "sync")
-    except Exception:
-        cluster = netbox_api.virtualization.clusters.get(name=cluster_name)
-    return cluster
+def get_or_create_kvm_cluster_for_device(node_name):
+    """
+    Получает или создаёт KVM-кластер для конкретного гипервизора и привязывает device.
+
+    Логика:
+      - Имя кластера = короткое имя device (node_name, например vv-kvm-01)
+      - Тип кластера = "KVM" (создаётся автоматически если нет)
+      - После создания/получения кластера выставляет device.cluster = этот кластер
+
+    Args:
+        node_name: короткое имя гипервизора (без домена)
+
+    Returns:
+        объект кластера NetBox или None при ошибке
+    """
+    nb_cluster = netbox_api.virtualization.clusters.get(name=node_name)
+    if not nb_cluster:
+        cluster_type = get_or_create_cluster_type("KVM")
+        try:
+            nb_cluster = netbox_api.virtualization.clusters.create(
+                name=node_name, type=cluster_type.id, status="active"
+            )
+            loging(f"[KVM] Cluster created: {node_name}", "sync")
+            print(f"  [+] Кластер NetBox создан: {node_name} (тип KVM)")
+        except Exception:
+            nb_cluster = netbox_api.virtualization.clusters.get(name=node_name)
+
+    if not nb_cluster:
+        loging(f"[KVM] Failed to get/create cluster for {node_name}", "error")
+        return None
+
+    # Привязываем device к кластеру (device.cluster = этот кластер)
+    device = nb_find_device(node_name)
+    if device:
+        if not device.cluster or device.cluster.id != nb_cluster.id:
+            try:
+                device.cluster = {"id": nb_cluster.id}
+                device.save()
+                loging(f"[KVM] Device {node_name} → cluster {node_name}", "sync")
+                print(f"  [~] Device {node_name} привязан к кластеру {node_name}")
+            except Exception as e:
+                loging(f"[KVM] Device cluster bind error {node_name}: {e}", "error")
+                print(f"  [!] Ошибка привязки device к кластеру: {e}")
+    else:
+        loging(f"[KVM] Device not found in NetBox: {node_name}", "error")
+        print(f"  [!] Device '{node_name}' не найден в NetBox — кластер создан, device не привязан")
+
+    return nb_cluster
 
 
 def parse_kvm_vm_list(hostid, node_name):
     """
     Читает список VM и их статусы через dependent items vmstatus.status[<VMNAME>].
 
-    Шаблон создаёт по одному dependent item на каждую VM через LLD discovery:
-        vmstatus.status[myvm]    → lastvalue = "running"
-        vmstatus.status[myvm2]  → lastvalue = "shut off"
-
-    Именно эти items видны в Zabbix Latest Data.
-    Имя VM извлекается из ключа item: vmstatus.status[<VMNAME>] → VMNAME.
-    Имя VM становится именем виртуальной машины в NetBox.
-
-    Поиск через search={"key_": "vmstatus.status["} находит все items
-    с ключами начинающимися на "vmstatus.status[" на данном хосте.
-
     Returns:
         list[dict]: [{"name": "myvm", "status_nb": "active", "status_raw": "running"}, ...]
     """
-    # Ищем все items с ключом vmstatus.status[*] на этом хосте
     items = zabbix_api.item.get(
         hostids=hostid,
         search={"key_": "vmstatus.status["},
@@ -1689,7 +1706,6 @@ def parse_kvm_vm_list(hostid, node_name):
         key    = item.get("key_", "")
         status = item.get("lastvalue", "").strip()
 
-        # Извлекаем VMNAME из ключа вида "vmstatus.status[myvm]"
         m = re.match(r'^vmstatus\.status\[(.+)\]$', key)
         if not m:
             loging(f"[KVM] unexpected key format: {key}", "debug")
@@ -1700,7 +1716,7 @@ def parse_kvm_vm_list(hostid, node_name):
             continue
 
         result.append({
-            "name":       vm_name,   # это имя станет частью имени VM в NetBox
+            "name":       vm_name,
             "status_nb":  kvm_status_to_nb(status),
             "status_raw": status,
         })
@@ -1713,16 +1729,6 @@ def parse_kvm_vm_list(hostid, node_name):
 def parse_kvm_vm_resources(hostid, node_name):
     """
     Читает CPU и память VM через мастер-item vmstatistic_cpu_mem.
-
-    vmstatistic_cpu_mem — RAW TEXT item, обновляется каждые 30 минут.
-    Структура JSON:
-        {"data": [{"VMNAME": "myvm", "actual": 4294967296, "nrVirtCpu": 4,
-                   "available": 2147483648, ...}, ...]}
-
-    Поля:
-      actual    — полный объём ОЗУ VM в байтах (Total RAM allocated to VM)
-      nrVirtCpu — количество vCPU (если нет — пробуем "vcpus")
-      Преобразуем actual bytes → MB для NetBox (поле memory в MB).
 
     Returns:
         dict: {vm_name: {"memory_mb": N, "vcpus": N}, ...}
@@ -1749,25 +1755,6 @@ def parse_kvm_vm_disks(hostid, node_name):
     """
     Читает диски VM через мастер-item vm_blk_discovery.
 
-    vm_blk_discovery — RAW TEXT item, обновляется каждые 30 минут.
-    Структура JSON:
-        {"data": [
-            {"VMNAME": "myvm", "Target": "vda",
-             "Source": "/var/lib/libvirt/images/myvm.qcow2",
-             "Device": "disk", "Type": "file"},
-            ...
-        ]}
-
-    Target  — имя устройства внутри VM (vda, vdb, hda, ...)
-    Source  — путь к образу на хосте или пул/том
-    Device  — тип: "disk", "cdrom", "floppy" (cdrom/floppy пропускаем)
-    Type    — тип бэкенда: "file", "block", "network"
-
-    Размер диска читается через dependent item:
-        disk.Capacity[VMNAME,TARGET] → байты → конвертируем в MB.
-
-    Имя диска в NetBox: "target:source" (уникально для VM).
-
     Returns:
         dict: {vm_name: [{"path": "vda:/path/to/img", "size_mb": N}, ...], ...}
     """
@@ -1784,11 +1771,9 @@ def parse_kvm_vm_disks(hostid, node_name):
         device  = rec.get("Device", "").strip()
         if not vm_name or not target:
             continue
-        # Пропускаем не-диски
         if device.lower() in ("cdrom", "floppy"):
             continue
 
-        # Размер через dependent item (может отсутствовать если LLD ещё не запустился)
         cap_key = f"disk.Capacity[{vm_name},{target}]"
         cap_val = get_kvm_dependent_value(hostid, cap_key)
         size_mb = 0
@@ -1798,7 +1783,6 @@ def parse_kvm_vm_disks(hostid, node_name):
             except Exception:
                 size_mb = 0
 
-        # Формируем путь: "target:source" или просто "target" если source пустой
         disk_path = f"{target}:{source}" if source else target
 
         if vm_name not in result:
@@ -1811,24 +1795,6 @@ def parse_kvm_vm_disks(hostid, node_name):
 def parse_kvm_vm_interfaces(hostid, node_name):
     """
     Читает сетевые интерфейсы VM через мастер-item vmlist_network.
-
-    vmlist_network — RAW TEXT item, обновляется каждые 30 минут.
-    Структура JSON:
-        {"data": [
-            {"VMNAME": "myvm", "Interface": "vnet0",
-             "MAC": "aa:bb:cc:dd:ee:ff", "Model": "virtio",
-             "Source": "br0", "Type": "bridge"},
-            ...
-        ]}
-
-    Interface — имя виртуального сетевого интерфейса на хосте (vnet0, vnet1, ...)
-    MAC       — MAC-адрес интерфейса
-    Model     — модель сетевой карты (virtio, e1000, rtl8139, ...)
-    Source    — бридж/сеть, к которой подключён интерфейс
-    Type      — тип подключения (bridge, network, ...)
-
-    Interface == "-1" означает "нет сетевого интерфейса" — фильтруем
-    (аналогично фильтру шаблона: conditions NOT_MATCHES_REGEX "-1").
 
     Returns:
         dict: {vm_name: [{"name": "vnet0", "mac": "aa:bb:...", "enabled": True}, ...], ...}
@@ -1851,14 +1817,26 @@ def parse_kvm_vm_interfaces(hostid, node_name):
         result[vm_name].append({
             "name":    iface_name,
             "mac":     mac if mac and mac not in ("-", "") else None,
-            "enabled": True,  # KVM не сообщает состояние link через этот item
+            "enabled": True,
         })
 
     return result
 
 
 def sync_kvm_vm_disks(nb_vm, kvm_disks):
-    """Синхронизирует virtual_disks KVM VM: нет в NB→создать, изменился→обновить, лишний→удалить."""
+    """
+    Синхронизирует virtual_disks KVM VM.
+
+    Защита от пустых данных: если kvm_disks пуст (Zabbix item vm_blk_discovery
+    ещё не собрал данные), удаление существующих дисков НЕ производится.
+    Создание и обновление также пропускается — нечего добавлять.
+    """
+    if not kvm_disks:
+        nb_count = len(list(netbox_api.virtualization.virtual_disks.filter(virtual_machine_id=nb_vm.id)))
+        loging(f"[{nb_vm.name}] KVM disks: Zabbix returned empty — skip sync (protect {nb_count} existing)", "debug")
+        print(f"      Дисков в KVM: 0  в NetBox: {nb_count}  → пропуск (Zabbix не вернул данные)")
+        return
+
     kvm_paths = {d["path"] for d in kvm_disks}
     nb_disks  = {
         d.name: d
@@ -1908,7 +1886,16 @@ def sync_kvm_vm_disks(nb_vm, kvm_disks):
 
 
 def sync_kvm_vm_interfaces(nb_vm, kvm_ifaces, all_macs_cache):
-    """Синхронизирует интерфейсы KVM VM: нет в NB→создать+MAC, изменился→обновить, лишний→удалить."""
+    """
+    Синхронизирует интерфейсы KVM VM.
+
+    Защита от пустых данных: если kvm_ifaces пуст (Zabbix item vmlist_network
+    ещё не собрал данные), удаление существующих интерфейсов НЕ производится.
+    """
+    if not kvm_ifaces:
+        loging(f"[{nb_vm.name}] KVM ifaces: Zabbix returned empty — skip sync", "debug")
+        return
+
     kvm_names = {i["name"] for i in kvm_ifaces}
     nb_ifaces  = {
         i.name: i
@@ -1947,20 +1934,41 @@ def sync_kvm_vm_interfaces(nb_vm, kvm_ifaces, all_macs_cache):
                 loging(f"[{nb_vm.name}] KVM iface delete error: {e}", "error")
 
 
-def sync_kvm_host(host_info, nb_cluster, role_vm_id, all_macs_cache, kvm_vm_names):
-    """Синхронизирует все VM одного KVM-гипервизора с NetBox. Имя VM: node/VMNAME."""
+def sync_kvm_host(host_info, role_vm_id, all_macs_cache, missing_vm_behavior):
+    """
+    Синхронизирует все VM одного KVM-гипервизора с NetBox.
+
+    v11:
+      - Создаёт/получает кластер NetBox с именем = короткое имя гипервизора
+      - Привязывает device к кластеру (device.cluster)
+      - Имя VM в NetBox = просто VMNAME (без префикса ноды)
+      - Исчезнувшие VM обрабатываются по missing_vm_behavior
+
+    Args:
+        host_info:            dict {zabbix_name, hostid, display}
+        role_vm_id:           ID роли VM в NetBox (или None)
+        all_macs_cache:       set MAC-адресов (общий для всего запуска)
+        missing_vm_behavior:  "delete" или "offline"
+    """
     node_name = host_info["zabbix_name"].split(".")[0]
     hostid    = host_info["hostid"]
 
-    print(f"  [>] KVM-гипервизор: {node_name} (hostid={hostid})")
+    print(f"\n  [>] KVM-гипервизор: {node_name} (hostid={hostid})")
     loging(f"[KVM] Processing host: {node_name}", "sync")
 
-    # Шаг 1: получаем список VM
+    # Получаем/создаём кластер и привязываем device
+    nb_cluster = get_or_create_kvm_cluster_for_device(node_name)
+    if not nb_cluster:
+        print(f"  [!] Не удалось создать/получить кластер для {node_name}, пропускаем")
+        return
+
+    host_dev = nb_find_device(node_name)
+
+    # Читаем данные из Zabbix (один запрос на тип данных)
     vm_list = parse_kvm_vm_list(hostid, node_name)
     if not vm_list:
-        return  # ошибка уже залогирована в parse_kvm_vm_list
+        return
 
-    # Шаги 2-4: читаем все данные (по одному запросу на тип)
     resources  = parse_kvm_vm_resources(hostid, node_name)
     all_disks  = parse_kvm_vm_disks(hostid, node_name)
     all_ifaces = parse_kvm_vm_interfaces(hostid, node_name)
@@ -1968,21 +1976,12 @@ def sync_kvm_host(host_info, nb_cluster, role_vm_id, all_macs_cache, kvm_vm_name
     print(f"    VM: {len(vm_list)},  с ресурсами: {len(resources)},  "
           f"с дисками: {len(all_disks)},  с интерфейсами: {len(all_ifaces)}")
 
-    # Привязываем гипервизор к кластеру если найден в NetBox
-    host_dev = nb_find_device(node_name)
-    if host_dev and (not host_dev.cluster or host_dev.cluster.id != nb_cluster.id):
-        host_dev.cluster = {"id": nb_cluster.id}
-        try:
-            host_dev.save()
-            loging(f"[KVM] Node {node_name} → cluster {nb_cluster.name}", "sync")
-        except Exception as e:
-            loging(f"[KVM] Node bind error {node_name}: {e}", "error")
+    # Множество имён VM на этом гипервизоре (для поиска исчезнувших)
+    kvm_vm_names = set()
 
-    # Шаг 5-6: обрабатываем каждую VM
     for vm in vm_list:
-        vm_name    = vm["name"]
-        vm_nb_name = f"{node_name}/{vm_name}"
-        kvm_vm_names.add(vm_nb_name)
+        vm_name = vm["name"]        # просто VMNAME, без префикса ноды
+        kvm_vm_names.add(vm_name)
 
         nb_status  = vm["status_nb"]
         res        = resources.get(vm_name, {})
@@ -1991,12 +1990,14 @@ def sync_kvm_host(host_info, nb_cluster, role_vm_id, all_macs_cache, kvm_vm_name
         kvm_disks  = all_disks.get(vm_name, [])
         kvm_ifaces = all_ifaces.get(vm_name, [])
 
-        nb_vm = netbox_api.virtualization.virtual_machines.get(name=vm_nb_name)
+        nb_vm = netbox_api.virtualization.virtual_machines.get(
+            name=vm_name, cluster_id=nb_cluster.id
+        )
 
         if nb_vm is None:
             # --- Создание VM ---
             create_data = {
-                "name":    vm_nb_name,
+                "name":    vm_name,
                 "cluster": nb_cluster.id,
                 "status":  nb_status,
             }
@@ -2008,11 +2009,11 @@ def sync_kvm_host(host_info, nb_cluster, role_vm_id, all_macs_cache, kvm_vm_name
 
             try:
                 nb_vm = netbox_api.virtualization.virtual_machines.create(create_data)
-                loging(f"[{node_name}] KVM VM created: {vm_nb_name}", "sync")
-                print(f"    + {vm_nb_name}  (status={vm['status_raw']}, "
+                loging(f"[{node_name}] KVM VM created: {vm_name}", "sync")
+                print(f"    + {vm_name}  (status={vm['status_raw']}, "
                       f"vcpus={vcpus}, mem={memory_mb}MB)")
             except Exception as e:
-                loging(f"[{node_name}] KVM VM create error {vm_nb_name}: {e}", "error")
+                loging(f"[{node_name}] KVM VM create error {vm_name}: {e}", "error")
                 continue
         else:
             # --- Обновление VM (только изменившиеся поля) ---
@@ -2023,19 +2024,19 @@ def sync_kvm_host(host_info, nb_cluster, role_vm_id, all_macs_cache, kvm_vm_name
                 nb_vm.status = nb_status; changed = True
                 changed_fields.append(f"status→{nb_status}")
             else:
-                loging(f"[{node_name}] KVM VM skip status (ok): {vm_nb_name}", "debug")
+                loging(f"[{node_name}] KVM VM skip status (ok): {vm_name}", "debug")
 
             if vcpus and nb_vm.vcpus != vcpus:
                 nb_vm.vcpus = vcpus; changed = True
                 changed_fields.append("vcpus")
             elif vcpus:
-                loging(f"[{node_name}] KVM VM skip vcpus (ok): {vm_nb_name}", "debug")
+                loging(f"[{node_name}] KVM VM skip vcpus (ok): {vm_name}", "debug")
 
             if memory_mb and nb_vm.memory != memory_mb:
                 nb_vm.memory = memory_mb; changed = True
                 changed_fields.append("memory")
             elif memory_mb:
-                loging(f"[{node_name}] KVM VM skip memory (ok): {vm_nb_name}", "debug")
+                loging(f"[{node_name}] KVM VM skip memory (ok): {vm_name}", "debug")
 
             if role_vm_id and (not nb_vm.role or nb_vm.role.id != role_vm_id):
                 nb_vm.role = role_vm_id; changed = True
@@ -2045,7 +2046,11 @@ def sync_kvm_host(host_info, nb_cluster, role_vm_id, all_macs_cache, kvm_vm_name
                 nb_vm.device = host_dev.id; changed = True
                 changed_fields.append("device")
 
-            # Тег zbb — добавляем если отсутствует
+            # Проверяем привязку к правильному кластеру (на случай переноса VM)
+            if not nb_vm.cluster or nb_vm.cluster.id != nb_cluster.id:
+                nb_vm.cluster = nb_cluster.id; changed = True
+                changed_fields.append("cluster")
+
             current_tag_names = {t["name"] for t in (nb_vm.tags or [])}
             if ZABBIX_TAG and ZABBIX_TAG.name not in current_tag_names:
                 nb_vm.tags = list(nb_vm.tags or []) + [ZABBIX_TAG.id]
@@ -2054,51 +2059,43 @@ def sync_kvm_host(host_info, nb_cluster, role_vm_id, all_macs_cache, kvm_vm_name
             if changed:
                 try:
                     nb_vm.save()
-                    loging(f"[{node_name}] KVM VM updated ({', '.join(changed_fields)}): {vm_nb_name}", "sync")
-                    print(f"    ~ {vm_nb_name}  [{', '.join(changed_fields)}]")
+                    loging(f"[{node_name}] KVM VM updated ({', '.join(changed_fields)}): {vm_name}", "sync")
+                    print(f"    ~ {vm_name}  [{', '.join(changed_fields)}]")
                 except Exception as e:
-                    loging(f"[{node_name}] KVM VM update error {vm_nb_name}: {e}", "error")
+                    loging(f"[{node_name}] KVM VM update error {vm_name}: {e}", "error")
             else:
-                print(f"    = {vm_nb_name}  → ok (no changes)")
-                loging(f"[{node_name}] KVM VM skip (no changes): {vm_nb_name}", "debug")
+                print(f"    = {vm_name}  → ok (no changes)")
+                loging(f"[{node_name}] KVM VM skip (no changes): {vm_name}", "debug")
 
         sync_kvm_vm_disks(nb_vm, kvm_disks)
         sync_kvm_vm_interfaces(nb_vm, kvm_ifaces, all_macs_cache)
 
+    # Обработка VM которые есть в кластере NetBox, но не на гипервизоре
+    for nb_vm in netbox_api.virtualization.virtual_machines.filter(cluster_id=nb_cluster.id):
+        if nb_vm.name not in kvm_vm_names:
+            _handle_missing_vm(nb_vm, missing_vm_behavior)
 
-def sync_kvm_cluster(kvm_hosts, cluster_name, role_vm_id):
-    """Синхронизирует VM всех KVM-гипервизоров в один кластер NetBox."""
-    loging(f"[KVM] Start sync cluster: {cluster_name}", "sync")
-    print(f"\n[KVM] Кластер: {cluster_name}")
 
-    nb_cluster = get_or_create_kvm_cluster(cluster_name)
-    loging(f"[KVM] NetBox cluster: {cluster_name} id={nb_cluster.id}", "sync")
+def sync_all_kvm_hosts(kvm_hosts, role_vm_id, missing_vm_behavior):
+    """
+    Запускает синхронизацию для каждого выбранного KVM-гипервизора.
+    Каждый гипервизор обрабатывается как отдельный независимый кластер.
 
-    # Один запрос для кэша MAC-адресов (используется _assign_mac)
+    Args:
+        kvm_hosts:            list[dict] — выбранные гипервизоры
+        role_vm_id:           ID роли VM (или None)
+        missing_vm_behavior:  "delete" или "offline"
+    """
+    loging(f"[KVM] Start sync {len(kvm_hosts)} hosts", "sync")
+    print(f"\n[KVM] Синхронизация {len(kvm_hosts)} гипервизоров (каждый = отдельный кластер)")
+
+    # Один запрос для кэша всех MAC-адресов (используется в _assign_mac)
     all_macs_cache = {str(m.mac_address) for m in netbox_api.dcim.mac_addresses.all()}
-    kvm_vm_names   = set()  # накапливаем имена VM, которые видели на гипервизорах
 
     for host_info in kvm_hosts:
-        sync_kvm_host(host_info, nb_cluster, role_vm_id, all_macs_cache, kvm_vm_names)
+        sync_kvm_host(host_info, role_vm_id, all_macs_cache, missing_vm_behavior)
 
-    # Удаляем из NetBox VM, которых нет ни на одном обработанном гипервизоре.
-    # ВАЖНО: удаляем только VM с нод, которые мы обходили.
-    # VM с необработанных гипервизоров не трогаем.
-    processed_nodes = {h["zabbix_name"].split(".")[0] for h in kvm_hosts}
-    for nb_vm in netbox_api.virtualization.virtual_machines.filter(cluster_id=nb_cluster.id):
-        if nb_vm.name in kvm_vm_names:
-            continue
-        vm_node = nb_vm.name.split("/")[0] if "/" in nb_vm.name else ""
-        if vm_node not in processed_nodes:
-            continue  # принадлежит необработанному гипервизору — не трогаем
-        try:
-            nb_vm.delete()
-            loging(f"[KVM] VM deleted: {nb_vm.name}", "sync")
-            print(f"    - удалена: {nb_vm.name}")
-        except Exception as e:
-            loging(f"[KVM] VM delete error {nb_vm.name}: {e}", "error")
-
-    loging(f"[KVM] Done: {cluster_name}", "sync")
+    loging(f"[KVM] Done all hosts", "sync")
 
 
 # --- main() ---
@@ -2117,7 +2114,12 @@ def main():
     # --- Шаг 2: выбор режима ---
     sync_devices, sync_disks_flag, sync_vms_flag, sync_kvm_flag = select_sync_mode()
 
-    # --- Шаг 3a: выбор Zabbix-групп (для режимов устройства/диски) ---
+    # --- Шаг 3: поведение при исчезнувших VM (только если выбрана синхронизация VM) ---
+    missing_vm_behavior = "delete"   # дефолт для режимов без VM
+    if sync_vms_flag or sync_kvm_flag:
+        missing_vm_behavior = select_missing_vm_behavior()
+
+    # --- Шаг 4a: выбор Zabbix-групп (для режимов устройства/диски) ---
     groups = []
     if sync_devices or sync_disks_flag:
         print("\n  [Шаг: выбор групп Zabbix для синхронизации устройств/дисков]")
@@ -2126,7 +2128,7 @@ def main():
             print("[!] Группы не выбраны, выход.")
             return
 
-    # --- Шаг 3b: выбор PVE-кластеров ---
+    # --- Шаг 4b: выбор PVE-кластеров ---
     pve_clusters = []
     if sync_vms_flag:
         pve_template_id = cfg["pve_template_id"]
@@ -2136,7 +2138,6 @@ def main():
             return
         print("\n  [Шаг: выбор PVE-кластеров для синхронизации VM]")
 
-        # Если группы уже выбраны — ограничиваем PVE-хосты только ими
         allowed_hostids = None
         if groups:
             allowed_hostids = {h["hostid"] for g in groups for h in g["hosts"]}
@@ -2146,7 +2147,7 @@ def main():
             print("[!] Кластеры PVE не выбраны, выход.")
             return
 
-    # --- Шаг 3c: выбор KVM-гипервизоров ---
+    # --- Шаг 4c: выбор KVM-гипервизоров ---
     kvm_hosts = []
     if sync_kvm_flag:
         kvm_template_id = cfg["kvm_template_id"]
@@ -2165,21 +2166,24 @@ def main():
             print("[!] KVM-хосты не выбраны, выход.")
             return
 
-    # --- Шаг 4: подтверждение запуска ---
+    # --- Шаг 5: подтверждение запуска ---
     mode_label = []
     if sync_devices:    mode_label.append("устройства")
     if sync_disks_flag: mode_label.append("диски")
     if sync_vms_flag:   mode_label.append("PVE VM")
     if sync_kvm_flag:   mode_label.append("KVM VM")
 
+    missing_label = "удалить" if missing_vm_behavior == "delete" else "→ offline"
+
     print(f"\n{'=' * 50}")
-    print(f"  Режим:  {' + '.join(mode_label)}")
+    print(f"  Режим:              {' + '.join(mode_label)}")
+    print(f"  Исчезнувшие VM:     {missing_label}")
     if groups:
-        print(f"  Групп:  {len(groups)}  ({sum(len(g['hosts']) for g in groups)} хостов)")
+        print(f"  Групп:              {len(groups)}  ({sum(len(g['hosts']) for g in groups)} хостов)")
     if pve_clusters:
-        print(f"  PVE-кластеров: {len(pve_clusters)}")
+        print(f"  PVE-кластеров:      {len(pve_clusters)}")
     if kvm_hosts:
-        print(f"  KVM-гипервизоров: {len(kvm_hosts)}")
+        print(f"  KVM-гипервизоров:   {len(kvm_hosts)}  (каждый = отдельный кластер)")
     print(f"{'=' * 50}")
     confirm = input("Запустить синхронизацию? [y/n]: ").strip().lower()
     if confirm != "y":
@@ -2187,11 +2191,10 @@ def main():
         return
 
     loging("=" * 50, "sync")
-    loging(f"Start sync | mode: {'+'.join(mode_label)}", "sync")
+    loging(f"Start sync | mode: {'+'.join(mode_label)} | missing_vm: {missing_vm_behavior}", "sync")
 
-    # --- Шаг 5a: устройства и/или диски ---
+    # --- Шаг 6a: устройства и/или диски ---
     if sync_devices or sync_disks_flag:
-        # Шаблоны, для хостов с которыми запускаем синхронизацию
         SYNC_TEMPLATES = ("Linux by Zabbix agent", "Proxmox VE by HTTP")
 
         for group in groups:
@@ -2202,7 +2205,6 @@ def main():
                 hostid    = host["hostid"]
                 templates = get_host_templates(hostid)
 
-                # Пропускаем хосты без нужных шаблонов
                 if not any(t in templates for t in SYNC_TEMPLATES):
                     continue
 
@@ -2214,9 +2216,8 @@ def main():
                     sync_disks_flag=sync_disks_flag
                 )
 
-    # --- Шаг 5b: PVE VM ---
+    # --- Шаг 6b: PVE VM ---
     if sync_vms_flag:
-        # Группируем выбранные ноды по кластеру (общий host:port = один кластер)
         processed_clusters = {}
         for h in pve_clusters:
             key = f"{h['host']}:{h['port']}"
@@ -2225,14 +2226,18 @@ def main():
             processed_clusters[key]["nodes"].add(h["zabbix_name"].split(".")[0])
 
         for key, cluster_data in processed_clusters.items():
-            sync_pve_cluster(cluster_data["entry"], allowed_nodes=cluster_data["nodes"])
+            sync_pve_cluster(
+                cluster_data["entry"],
+                allowed_nodes=cluster_data["nodes"],
+                missing_vm_behavior=missing_vm_behavior,
+            )
 
-    # --- Шаг 5c: KVM VM ---
+    # --- Шаг 6c: KVM VM ---
     if sync_kvm_flag:
-        sync_kvm_cluster(
-            kvm_hosts    = kvm_hosts,
-            cluster_name = cfg["kvm_cluster"],
-            role_vm_id   = cfg.get("kvm_role_vm"),
+        sync_all_kvm_hosts(
+            kvm_hosts=kvm_hosts,
+            role_vm_id=cfg.get("kvm_role_vm"),
+            missing_vm_behavior=missing_vm_behavior,
         )
 
     loging("Sync finished", "sync")

@@ -26,7 +26,7 @@ zbx-nbx/
 ### 1. Клонировать репозиторий
 
 ```bash
-git clone https://github.com/yourorg/zbx-nbx.git
+git clone https://github.com/lzhkn/zbx-nbx.git
 cd zbx-nbx
 ```
 

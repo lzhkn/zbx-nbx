@@ -398,16 +398,14 @@ def select_missing_vm_behavior():
             loging("Missing VM behavior: delete", "sync")
             return "delete"
         if choice == "n":
-            print("  → Исчезнувшие VM будут переведены в offline, тег zbb будет убран")
+            print("  → Исчезнувшие VM будут переведены в offline")
             loging("Missing VM behavior: offline", "sync")
             return "offline"
         print("  [!] Введите y или n")
 
 
 def _handle_missing_vm(nb_vm, missing_vm_behavior):
-    """Удаляет или переводит в offline VM отсутствующую на гипервизоре.
-    При offline — также убирает тег zbb.
-    """
+    """Удаляет или переводит в offline VM отсутствующую на гипервизоре."""
     if missing_vm_behavior == "delete":
         try:
             nb_vm.delete()
@@ -419,25 +417,12 @@ def _handle_missing_vm(nb_vm, missing_vm_behavior):
     else:
         try:
             current_status = nb_vm.status.value if nb_vm.status else ""
-            update_data    = {}
-            changed_fields = []
-
             if current_status != "offline":
-                update_data["status"] = "offline"
-                changed_fields.append("status→offline")
-
-            # убираем тег zbb
-            current_tag_ids = [t.id for t in (nb_vm.tags or [])]
-            if ZABBIX_TAG and ZABBIX_TAG.id in current_tag_ids:
-                update_data["tags"] = [tid for tid in current_tag_ids if tid != ZABBIX_TAG.id]
-                changed_fields.append("tag-zbb")
-
-            if update_data:
-                nb_vm.update(update_data)
-                loging(f"[VM] Missing VM updated ({', '.join(changed_fields)}): {nb_vm.name}", "sync")
-                print(f"    ~ {nb_vm.name}  [{', '.join(changed_fields)}]")
+                nb_vm.update({"status": "offline"})
+                loging(f"[VM] Set offline missing VM: {nb_vm.name}", "sync")
+                print(f"    ~ offline: {nb_vm.name}")
             else:
-                loging(f"[VM] Already offline, no zbb tag (skip): {nb_vm.name}", "debug")
+                loging(f"[VM] Already offline (skip): {nb_vm.name}", "debug")
         except Exception as e:
             loging(f"[VM] Set offline error {nb_vm.name}: {e}", "error")
             print(f"    ! ошибка offline {nb_vm.name}: {e}")

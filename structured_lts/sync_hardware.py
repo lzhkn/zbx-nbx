@@ -92,7 +92,7 @@ def get_disks_from_netbox(device_id):
 
 
 def sync_disks(device, zabbix_disks):
-    """Синхронизирует диски: Zabbix→active+zbb, только NetBox→offline."""
+    """Синхронизирует диски: Zabbix→active+zbb, только NetBox→offline (тег zbb убирается)."""
     from common import ZABBIX_TAG, DISKS_ROLE  # читаем актуальные глобалы
 
     if not ZABBIX_TAG or not DISKS_ROLE:
@@ -105,6 +105,7 @@ def sync_disks(device, zabbix_disks):
 
     print(f"      Дисков в Zabbix: {len(zabbix_serials)}  в NetBox: {len(netbox_serials)}")
 
+    # --- Диски видимые в Zabbix: создать или обновить (active + zbb) ---
     for serial in zabbix_serials:
         disk_data = zabbix_disks[serial]
 
@@ -118,7 +119,7 @@ def sync_disks(device, zabbix_disks):
                 needs_update = True
 
             if ZABBIX_TAG and ZABBIX_TAG.id not in [t.id for t in (nb_disk.tags or [])]:
-                update_data["tags"] = [ZABBIX_TAG.id]
+                update_data["tags"] = [t.id for t in (nb_disk.tags or [])] + [ZABBIX_TAG.id]
                 needs_update = True
 
             if not nb_disk.role or nb_disk.role.id != DISKS_ROLE.id:
@@ -164,12 +165,30 @@ def sync_disks(device, zabbix_disks):
                 print(f"      ! disk {disk_data['name']} [{serial}]  → ERROR: {e}")
                 loging(f"[{device.name}] Disk create error: {e}", "error")
 
+    # --- Диски только в NetBox: перевести в offline, убрать тег zbb ---
     for serial in (netbox_serials - zabbix_serials):
         try:
             nb_disk = netbox_disks[serial]
-            nb_disk.update({"status": "offline"})
-            print(f"      - disk {nb_disk.name} [{serial}]  → offline")
-            loging(f"[{device.name}] Disk set offline: {serial}", "sync")
+            update_data    = {}
+            changed_fields = []
+
+            if not nb_disk.status or nb_disk.status.value != "offline":
+                update_data["status"] = "offline"
+                changed_fields.append("status→offline")
+
+            # убираем тег zbb
+            current_tag_ids = [t.id for t in (nb_disk.tags or [])]
+            if ZABBIX_TAG and ZABBIX_TAG.id in current_tag_ids:
+                update_data["tags"] = [tid for tid in current_tag_ids if tid != ZABBIX_TAG.id]
+                changed_fields.append("tag-zbb")
+
+            if update_data:
+                nb_disk.update(update_data)
+                print(f"      - disk {nb_disk.name} [{serial}]  → {', '.join(changed_fields)}")
+                loging(f"[{device.name}] Disk offline [{', '.join(changed_fields)}]: {serial}", "sync")
+            else:
+                print(f"      = disk {nb_disk.name} [{serial}]  → already offline, no zbb (skip)")
+                loging(f"[{device.name}] Disk already offline, no zbb (skip): {serial}", "debug")
         except Exception as e:
             print(f"      ! disk [{serial}]  → offline ERROR: {e}")
             loging(f"[{device.name}] Disk offline error: {e}", "error")

@@ -81,10 +81,15 @@ def parse_lxc_interfaces(config_lxc):
 def parse_vm_disks(config_vm, node_name):
     disks = []
     for key, val in config_vm.items():
-        is_disk = ("scsi" in key and key != "scsihw") or "ide" in key
-        if not is_disk or "cdrom" in val:
+        if not (key.startswith("scsi") or key.startswith("ide") or
+                key.startswith("sata") or key.startswith("virtio")):
             continue
-        path = f"{node_name}/{val.split(',')[0]}"
+        if key in ("scsihw",):
+            continue
+        if "cdrom" in val or "none" in val:
+            continue
+        storage_part = val.split(",")[0]
+        path = f"{node_name}/{storage_part}"
         size = 0
         for part in val.split(","):
             if part.startswith("size="):
@@ -99,51 +104,14 @@ def parse_vm_disks(config_vm, node_name):
 def parse_vm_interfaces(config_vm):
     interfaces = []
     for key, val in config_vm.items():
-        if key.startswith("net"):
-            interfaces.append({
-                "name":    key,
-                "mac":     parse_mac_from_iface(val),
-                "enabled": "link_down" not in val,
-            })
+        if not key.startswith("net"):
+            continue
+        interfaces.append({
+            "name":    key,
+            "mac":     parse_mac_from_iface(val),
+            "enabled": "link_down" not in val,
+        })
     return interfaces
-
-
-# --- NetBox: кластер per-нода ---
-
-def get_or_create_pve_cluster_for_node(node_name):
-    """Получает/создаёт кластер NetBox с именем ноды, привязывает device."""
-    nb_cluster = netbox_api.virtualization.clusters.get(name=node_name)
-    if not nb_cluster:
-        cluster_type = get_or_create_cluster_type("Proxmox VE")
-        try:
-            nb_cluster = netbox_api.virtualization.clusters.create(
-                name=node_name, type=cluster_type.id, status="active"
-            )
-            loging(f"[PVE] Cluster created: {node_name}", "sync")
-            print(f"  [+] Кластер NetBox создан: {node_name} (тип Proxmox VE)")
-        except Exception:
-            nb_cluster = netbox_api.virtualization.clusters.get(name=node_name)
-
-    if not nb_cluster:
-        loging(f"[PVE] Failed to get/create cluster for {node_name}", "error")
-        return None
-
-    device = nb_find_device(node_name)
-    if device:
-        if not device.cluster or device.cluster.id != nb_cluster.id:
-            try:
-                device.cluster = {"id": nb_cluster.id}
-                device.save()
-                loging(f"[PVE] Device {node_name} → cluster {node_name}", "sync")
-                print(f"  [~] Device {node_name} привязан к кластеру {node_name}")
-            except Exception as e:
-                loging(f"[PVE] Device cluster bind error {node_name}: {e}", "error")
-                print(f"  [!] Ошибка привязки device к кластеру: {e}")
-    else:
-        loging(f"[PVE] Device not found in NetBox: {node_name}", "error")
-        print(f"  [!] Device '{node_name}' не найден в NetBox — кластер создан, device не привязан")
-
-    return nb_cluster
 
 
 # --- MAC ---
@@ -180,7 +148,11 @@ def _assign_mac(nb_iface, mac, all_macs_cache):
 # --- Синхронизация дисков и интерфейсов VM ---
 
 def sync_vm_disks_nb(nb_vm, pve_disks):
-    """Синхронизирует virtual_disks VM. Пустой список → пропуск (защита данных)."""
+    """Синхронизирует virtual_disks VM: создаёт/обновляет (с тегом zbb), удаляет исчезнувшие.
+    Пустой список → пропуск (защита данных).
+    """
+    from common import ZABBIX_TAG  # актуальный глобал
+
     if not pve_disks:
         nb_count = len(list(netbox_api.virtualization.virtual_disks.filter(virtual_machine_id=nb_vm.id)))
         loging(f"[{nb_vm.name}] PVE disks: empty — skip sync (protect {nb_count} existing)", "debug")
@@ -197,25 +169,43 @@ def sync_vm_disks_nb(nb_vm, pve_disks):
 
     for disk in pve_disks:
         size_gb = f"{disk['size'] // 1000}G" if disk["size"] >= 1000 else f"{disk['size']}M"
+
         if disk["path"] not in nb_vm_disks:
+            # Создаём новый диск с тегом zbb
+            disk_create = {
+                "virtual_machine": nb_vm.id,
+                "name":            disk["path"],
+                "size":            disk["size"],
+            }
+            if ZABBIX_TAG:
+                disk_create["tags"] = [ZABBIX_TAG.id]
             try:
-                netbox_api.virtualization.virtual_disks.create({
-                    "virtual_machine": nb_vm.id,
-                    "name":  disk["path"],
-                    "size":  disk["size"],
-                })
+                netbox_api.virtualization.virtual_disks.create(disk_create)
                 print(f"      + disk {disk['path']} ({size_gb})  → created")
                 loging(f"[{nb_vm.name}] Disk created: {disk['path']}", "sync")
             except Exception as e:
                 print(f"      ! disk {disk['path']}  → ERROR: {e}")
                 loging(f"[{nb_vm.name}] Disk create error: {e}", "error")
         else:
-            nb_disk = nb_vm_disks[disk["path"]]
+            # Обновляем существующий диск: size + тег zbb
+            nb_disk      = nb_vm_disks[disk["path"]]
+            disk_update  = {}
+            disk_changed = []
+
             if nb_disk.size != disk["size"]:
+                disk_update["size"] = disk["size"]
+                disk_changed.append("size")
+
+            current_tag_ids = [t.id for t in (nb_disk.tags or [])]
+            if ZABBIX_TAG and ZABBIX_TAG.id not in current_tag_ids:
+                disk_update["tags"] = current_tag_ids + [ZABBIX_TAG.id]
+                disk_changed.append("tag+zbb")
+
+            if disk_update:
                 try:
-                    nb_disk.update({"size": disk["size"]})
-                    print(f"      ~ disk {disk['path']} ({size_gb})  → size updated")
-                    loging(f"[{nb_vm.name}] Disk size updated: {disk['path']}", "sync")
+                    nb_disk.update(disk_update)
+                    print(f"      ~ disk {disk['path']} ({size_gb})  → {', '.join(disk_changed)}")
+                    loging(f"[{nb_vm.name}] Disk updated [{', '.join(disk_changed)}]: {disk['path']}", "sync")
                 except Exception as e:
                     print(f"      ! disk {disk['path']}  → update ERROR: {e}")
                     loging(f"[{nb_vm.name}] Disk update error: {e}", "error")
@@ -223,6 +213,7 @@ def sync_vm_disks_nb(nb_vm, pve_disks):
                 print(f"      = disk {disk['path']} ({size_gb})  → ok")
                 loging(f"[{nb_vm.name}] Disk skip (ok): {disk['path']}", "debug")
 
+    # Удаляем диски которых нет на PVE
     for name, nb_disk in nb_vm_disks.items():
         if name not in pve_paths:
             try:
@@ -375,70 +366,83 @@ def select_pve_clusters(template_id, allowed_hostids=None):
             print("  [!] Введите номера через запятую или 'all'")
 
 
-# --- Основная синхронизация ---
+# --- Кластер per-нода ---
 
-def sync_pve_cluster(cluster_info, allowed_nodes=None, missing_vm_behavior="delete"):
-    """Синхронизирует ноды PVE-кластера или standalone-ноды с NetBox."""
+def get_or_create_pve_cluster_for_node(node_name):
+    """Получает/создаёт PVE-кластер NetBox и привязывает device."""
+    nb_cluster = netbox_api.virtualization.clusters.get(name=node_name)
+    if not nb_cluster:
+        cluster_type = get_or_create_cluster_type("Proxmox VE")
+        try:
+            nb_cluster = netbox_api.virtualization.clusters.create(
+                name=node_name, type=cluster_type.id, status="active"
+            )
+            loging(f"[PVE] Cluster created: {node_name}", "sync")
+            print(f"  [+] Кластер NetBox создан: {node_name} (тип Proxmox VE)")
+        except Exception:
+            nb_cluster = netbox_api.virtualization.clusters.get(name=node_name)
+
+    if not nb_cluster:
+        loging(f"[PVE] Failed to get/create cluster for {node_name}", "error")
+        return None
+
+    device = nb_find_device(node_name)
+    if device:
+        if not device.cluster or device.cluster.id != nb_cluster.id:
+            try:
+                device.cluster = {"id": nb_cluster.id}
+                device.save()
+                loging(f"[PVE] Device {node_name} → cluster {node_name}", "sync")
+                print(f"  [~] Device {node_name} привязан к кластеру {node_name}")
+            except Exception as e:
+                loging(f"[PVE] Device cluster bind error {node_name}: {e}", "error")
+                print(f"  [!] Ошибка привязки device к кластеру: {e}")
+    else:
+        loging(f"[PVE] Device not found in NetBox: {node_name}", "error")
+        print(f"  [!] Device '{node_name}' не найден в NetBox — кластер создан, device не привязан")
+
+    return nb_cluster
+
+
+# --- Синхронизация одного PVE-кластера ---
+
+def sync_pve_cluster(cluster_info, allowed_nodes=None, missing_vm_behavior="offline"):
+    """Синхронизирует все VM/LXC одного PVE-кластера (или standalone-ноды)."""
     from common import ZABBIX_TAG  # актуальный глобал
 
     role_vm_id = cfg.get("pve_role_vm")
-    loging(f"[PVE] Start: {cluster_info['zabbix_name']}", "sync")
-    print(f"\n[PVE] Подключение: {cluster_info['zabbix_name']} ({cluster_info['host']})")
-    if allowed_nodes:
-        print(f"  Фильтр нод: {', '.join(sorted(allowed_nodes))}")
 
-    try:
-        proxmox = ProxmoxAPI(
-            host=cluster_info["host"],
-            port=int(cluster_info["port"]),
-            user=cluster_info["user"],
-            token_name=cluster_info["token_id"],
-            token_value=cluster_info["token"],
-            verify_ssl=False,
-            service="PVE"
-        )
-    except Exception as e:
-        loging(f"[PVE] Connection error {cluster_info['zabbix_name']}: {e}", "error")
-        print(f"  [!] Ошибка подключения: {e}")
-        return
+    proxmox = ProxmoxAPI(
+        cluster_info["host"],
+        port=int(cluster_info["port"]),
+        user=cluster_info["user"],
+        token_name=cluster_info["token_id"],
+        token_value=cluster_info["token"],
+        verify_ssl=False,
+    )
 
-    try:
-        nodes = proxmox.nodes.get()
-    except Exception as e:
-        loging(f"[PVE] nodes.get() failed {cluster_info['zabbix_name']}: {e}", "error")
-        print(f"  [!] Не удалось получить список нод: {e}")
-        return
-
-    # Реальный PVE-кластер → обходим все ноды (allowed_nodes игнорируется).
-    # Standalone → фильтруем по allowed_nodes.
+    # Определяем список нод
     try:
         cluster_status = proxmox.cluster.status.get()
-        is_real_cluster = any(e["type"] == "cluster" for e in cluster_status)
-    except Exception:
-        is_real_cluster = False
+        cluster_record = next((r for r in cluster_status if r.get("type") == "cluster"), None)
+        if cluster_record:
+            nodes = [r["name"] for r in cluster_status if r.get("type") == "node"]
+            loging(f"[PVE] Real cluster detected: {cluster_record.get('name')}, nodes={nodes}", "sync")
+        else:
+            nodes = [r["name"] for r in cluster_status if r.get("type") == "node"]
+    except Exception as e:
+        loging(f"[PVE] cluster.status failed: {e}", "error")
+        nodes = [cluster_info["zabbix_name"].split(".")[0]]
 
-    effective_allowed_nodes = None if is_real_cluster else allowed_nodes
+    if allowed_nodes:
+        nodes = [n for n in nodes if n in allowed_nodes]
 
-    if is_real_cluster:
-        print(f"  Режим: PVE-кластер — обходим все ноды")
-    else:
-        print(f"  Режим: standalone-нода")
+    loging(f"[PVE] Processing nodes: {nodes}", "sync")
+    print(f"\n[PVE] Кластер: {cluster_info['zabbix_name']} | Ноды: {', '.join(nodes)}")
 
     all_macs_cache = {str(m.mac_address) for m in netbox_api.dcim.mac_addresses.all()}
 
-    for node in nodes:
-        node_name = node["node"]
-
-        if effective_allowed_nodes and node_name not in effective_allowed_nodes:
-            loging(f"[PVE] Node not in selection, skip: {node_name}", "sync")
-            print(f"  [~] Нода пропущена (не выбрана): {node_name}")
-            continue
-
-        if node["status"] != "online":
-            loging(f"[PVE] Node offline, skip: {node_name}", "sync")
-            print(f"  [~] Нода offline, пропускаем: {node_name}")
-            continue
-
+    for node_name in nodes:
         print(f"\n  [>] Нода: {node_name}")
 
         nb_cluster = get_or_create_pve_cluster_for_node(node_name)
@@ -647,18 +651,12 @@ def sync_pve_cluster(cluster_info, allowed_nodes=None, missing_vm_behavior="dele
 
                 if nb_vm.vcpus != config_ct.get("cores", 1):
                     nb_vm.vcpus = config_ct.get("cores", 1); changed = True; changed_fields.append("vcpus")
-                else:
-                    loging(f"[{node_name}] LXC skip vcpus (ok): {ct_nb_name}", "debug")
 
                 if nb_vm.memory != int(config_ct.get("memory", 0)):
                     nb_vm.memory = config_ct.get("memory", 0); changed = True; changed_fields.append("memory")
-                else:
-                    loging(f"[{node_name}] LXC skip memory (ok): {ct_nb_name}", "debug")
 
                 if (nb_vm.serial or "") != ct_serial:
                     nb_vm.serial = ct_serial; changed = True; changed_fields.append("serial")
-                else:
-                    loging(f"[{node_name}] LXC skip serial (ok): {ct_nb_name}", "debug")
 
                 if role_vm_id and (not nb_vm.role or nb_vm.role.id != role_vm_id):
                     nb_vm.role = role_vm_id; changed = True; changed_fields.append("role")
